@@ -19,6 +19,7 @@ Usage:
   typer-test --time 120           longer test
   typer-test --mode punctuation   drill commas, periods, semicolons
   typer-test --mode contractions  drill you're / you've / I'd ...
+  typer-test --mode plain         no contractions, only commas and periods
   typer-test --offline            skip claude, use built-in quotes
   typer-test --help
 
@@ -64,6 +65,13 @@ QUOTES = {
         "A goal without a date is a wish; so pick a day, mark it down, and tell yourself, I'll start, and I won't stop.",
         "It's not a lack of time; it's a lack of focus. Choose one thing, finish it, and then you've earned the next.",
     ],
+    "plain": [
+        "Success is not an accident. It is the result of preparation, effort, and learning from every mistake you make.",
+        "Great things take time. Focus on one step, finish it well, and the next step will feel much easier.",
+        "A calm mind sees clearly. When you slow down, breathe, and think before you act, you make better choices.",
+        "Small habits build big results. Read a little every day, practice a little every day, and watch yourself grow.",
+        "Kindness costs nothing but means everything. A simple smile, a patient word, or a helping hand can brighten a whole room.",
+    ],
 }
 
 TIPS = [
@@ -77,7 +85,7 @@ TIPS = [
 ]
 
 PUNCT = set(".,;:!?'\"-")
-MODES = ["mixed", "punctuation", "contractions"]
+MODES = ["mixed", "punctuation", "contractions", "plain"]
 TIMES = [30, 60, 90, 120, 180]
 CLAUDE_TIMEOUT = 45  # seconds to wait for `claude -p`
 
@@ -126,6 +134,10 @@ def build_prompt(mode):
     elif mode == "punctuation":
         focus = ("It MUST use several commas, at least one semicolon, and a colon if it fits, "
                  "so it is good practice for where punctuation goes. ")
+    elif mode == "plain":
+        focus = ("It MUST NOT use any contractions or apostrophes at all (write 'do not' instead of "
+                 "'don't', 'it is' instead of 'it's'). It MUST NOT use semicolons or colons. "
+                 "Use ONLY commas and a final period as punctuation. ")
     else:
         focus = ("It MUST use at least three contractions (you're, you've, I'd, it's, don't), "
                  "several commas, and at least one semicolon. ")

@@ -67,6 +67,7 @@ typer-test                      # 60s test, mixed mode, AI quotes
 typer-test --time 120           # longer test
 typer-test --mode punctuation   # drill commas, periods, semicolons
 typer-test --mode contractions  # drill you're / you've / I'd ...
+typer-test --mode plain         # no contractions, only commas and periods
 typer-test --offline            # skip claude, use built-in quotes
 typer-test --help
 ```
@@ -84,6 +85,7 @@ typer-test --help
 - **mixed** *(default)* — contractions + punctuation together
 - **punctuation** — heavy on commas, periods, semicolons, colons
 - **contractions** — heavy on `you're`, `you've`, `I'd`, `it's`, `don't` …
+- **plain** — no contractions or abbreviations at all, only `,` and `.`
 
 ### Time options
 
