@@ -15,27 +15,108 @@ If `claude` is not installed or a request fails, it falls back to a built-in
 set of quotes so the trainer always works offline.
 
 Usage:
-  typer-test                      start a test (60s, mixed mode, AI quotes)
+  typer-test                      start (default mode: read/books)
   typer-test --time 120           longer test
   typer-test --mode punctuation   drill commas, periods, semicolons
   typer-test --mode contractions  drill you're / you've / I'd ...
   typer-test --mode plain         no contractions, only commas and periods
+  typer-test --mode read          practice typing your own book (see below)
   typer-test --offline            skip claude, use built-in quotes
+  typer-test --add-book novel.epub   import/resume a book, print status, exit
   typer-test --help
 
+Reading mode: cycle mode (m) to "read" on the start screen, then press [b] to
+add your own .txt/.epub/.pdf and practice typing its actual text, one page at
+a time. There is no timer in this mode: a page is shown for as long as it
+takes, and finishing it automatically flips to the next page (no results
+screen in between). Pressing Esc stops the session and returns to the menu.
+Progress (page + line), last-read date, and WPM are always saved when a round
+ends, so the next session picks up right where you left off.
+
+While actively reading, you can jump around without stopping first: left and
+right arrows move to the previous/next page (or the next/previous group of
+pages, see Ctrl+P below). Right always marks the current page(s) complete
+(regardless of how much you'd typed) and moves on; left goes back. Ctrl+G
+prompts for a specific page number to jump to. Ctrl+P shows one more page in
+the same window (e.g. two book-pages combined into one round); if the
+combined text would not fit the terminal, nothing changes and an error is
+shown instead. Ctrl+L opens the detailed book list (same screen as [l] on the
+start menu) so you can switch to a different book mid-session, without
+losing your place -- adding or deleting a book is menu-only, via [b] after
+Esc. Ctrl+Q quits the app outright. Enter does nothing while reading. Plain
+letter keys are never intercepted while reading (book text constantly
+contains g/l/p/q), which is why these use Ctrl -- with one exception: Ctrl+M
+and Ctrl+J are physically the same bytes as Enter/Return in most terminals,
+so neither can be a reading-time shortcut; cycle mode from the start screen
+([m]) instead.
+
+WPM in reading mode is a running average for the whole book, not a per-page
+number: it starts from your saved average the instant a page loads (never 0
+on a fresh page or after flipping), keeps updating live as you type, and
+freezes -- rather than decaying -- the moment you stop typing, so pausing
+mid-page never hurts it. It is saved to the database every time a round ends.
+
+The reading screen shows: top-left your overall book progress (%, same
+format/position as wpm) plus wpm/accuracy; top-right the book's title;
+bottom-left the current page count (e.g. "page 3/12"); bottom the key hints.
+
+Reading settings (Ctrl+C while reading, or [c] on the start screen):
+
+  show images    turn <img> into a typeable "(image: caption)" placeholder
+                 instead of dropping the picture silently
+  include code   keep the contents of <pre> code blocks as text to type
+                 (inline <code> inside a sentence is always kept -- it is prose)
+  skip names     the cursor jumps over speaker cues and proper nouns; the name
+                 stays on the page in its own colour but is never typed, so
+                 "forget. BENVOLIO. I'll" is typed as "forget. I'll"
+
+The image/code settings change how a book is read off disk, so a book imported
+under different settings is rebuilt automatically the next time you open it
+(its page number is kept, clamped, since page boundaries can shift). Only EPUB
+marks images and code up explicitly -- plain text and PDF carry no reliable
+signal for either. Ctrl+C works here because the reading loop puts the
+terminal in raw mode; everywhere else Ctrl+C still interrupts as usual.
+
+Every typing session, in every mode, tracks which words trip you up: how many
+times you failed to type a word cleanly on the first pass (a later backspace
+fix still counts as a fail) and your average time on it. Numbers, times,
+dates, and words that look like proper nouns (capitalized mid-sentence --
+names of people/places) are never tracked, since they are one-off tokens
+rather than useful practice targets. Press Ctrl+F on the start screen to see
+that list, sorted by highest average time first (your slowest words, not
+just your most-failed ones). Whenever a new quote is generated with `claude
+-p`, the prompt always asks it to naturally include a few of these words, so
+you keep getting practice on exactly what trips you up.
+
 Controls:
-  start screen : Enter=start  t=change time  m=change mode  a=AI on/off  q=quit
+  start screen : Enter=start (resumes where you left off)  t=change time
+                 m=change mode  a=AI on/off  (mode=read) b=book library
+                 l=list books  ^F=struggle words  q=quit
+  while reading: left/right=prev/next page(s)  ^G=jump to page
+                 ^P=add more words  ^C=settings  ^L=list/switch books  ^Q=quit app
+  settings     : up/down move  space/Enter toggle  Esc done
   while typing : type the gray text; Backspace fixes a slip; Esc cancels
   results      : Enter=again  s=settings  q=quit
 """
 
 import argparse
+import contextlib
 import curses
+import json
+import os
+import posixpath
 import random
+import re
 import shutil
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
+import zipfile
+from html.parser import HTMLParser
+from urllib.parse import unquote
+from xml.etree import ElementTree as ET
 
 # ---------------------------------------------------------------------------
 # Content
@@ -85,15 +166,59 @@ TIPS = [
 ]
 
 PUNCT = set(".,;:!?'\"-")
-MODES = ["mixed", "punctuation", "contractions", "plain"]
+MODES = ["mixed", "punctuation", "contractions", "plain", "read"]
 TIMES = [30, 60, 90, 120, 180]
 CLAUDE_TIMEOUT = 45  # seconds to wait for `claude -p`
 
+BOOK_EXTS = (".txt", ".epub", ".pdf")
+LINES_PER_PAGE = 12
+MIN_TRAILING_PAGE_CHARS = 40
+DB_PATH = os.path.expanduser("~/.local/share/typer-test/library.db")
+BACKSPACE_KEYS = (curses.KEY_BACKSPACE, 127, 8)
+ENTER_KEYS = (10, 13, curses.KEY_ENTER)
+ABBREVIATIONS = {"mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "sr.", "jr.", "vs.", "etc.", "e.g.", "i.e."}
+
+# Ctrl+letter control codes (identical on every OS/terminal). Ctrl+M and Ctrl+J are
+# deliberately absent -- both are physically the same byte as Enter/Return.
+# Ctrl+C only reaches us because the reading loop switches the terminal to raw
+# mode; under normal cbreak it would be delivered as SIGINT instead.
+CTRL_C, CTRL_F, CTRL_G, CTRL_L, CTRL_P, CTRL_Q = 3, 6, 7, 12, 16, 17
+
+# Reading preferences, persisted in the config table. The image/code settings
+# change how a book's text is EXTRACTED, so a book imported under different
+# settings is re-extracted on next read; skip_names only affects typing.
+CONFIG_DEFAULTS = {
+    "show_images": "0",   # render "(image: caption)" placeholders instead of dropping them
+    "include_code": "1",  # keep <pre> code blocks as text to type
+    "skip_names": "0",    # cursor jumps over speaker names / proper nouns
+}
+CONFIG_LABELS = {
+    "show_images": "show images as (image: caption)",
+    "include_code": "include code blocks",
+    "skip_names": "skip names while typing",
+}
+EXTRACTION_KEYS = ("show_images", "include_code")
+
+# Screen geometry. draw_test lays the target out starting at row TEXT_TOP and
+# must leave BOTTOM_ROWS free at the bottom for the page label + key hints;
+# text_fits/fit_line_count derive the usable row count from these, so the
+# "does it fit" maths and the drawing code can never drift apart.
+MARGIN = 4
+TEXT_TOP = 4
+BOTTOM_ROWS = 2
+SPINNER_FRAMES = "|/-\\"
+FRAME_SLEEP = 0.03          # idle poll interval inside the typing loop
+SPINNER_SLEEP = 0.08
+MAX_WORD_SECONDS = 10.0     # cap per-word timing so one long pause can't poison an average
+MAX_DISPLAY_WPM = 999       # keeps the status bar from showing absurd early-keystroke spikes
+
 
 def pool(mode):
-    if mode == "mixed":
+    """Built-in fallback quotes for a mode. 'read' has no quote pool (it types
+    the user's own book), so it falls back to the mixed set."""
+    if mode in ("mixed", "read"):
         return QUOTES["contractions"] + QUOTES["punctuation"] + QUOTES["mixed"]
-    return QUOTES[mode]
+    return QUOTES.get(mode, QUOTES["mixed"])
 
 
 # ---------------------------------------------------------------------------
@@ -105,15 +230,27 @@ def pool(mode):
 _TRANS = {
     "’": "'", "‘": "'", "“": '"', "”": '"',
     "—": "-", "–": "-", "…": "...", " ": " ",
-    "«": '"', "»": '"',
+    "«": '"', "»": '"', "\xa0": " ",
 }
+
+
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_DROP_CHARS = "|[]"
+
+
+def to_ascii(text):
+    """Normalise smart punctuation/nbsp to plain ASCII, strip URLs and
+    | [ ] characters, and drop anything else non-typeable."""
+    for a, b in _TRANS.items():
+        text = text.replace(a, b)
+    text = _URL_RE.sub(" ", text)
+    text = "".join(ch for ch in text if ch not in _DROP_CHARS)
+    return "".join(ch for ch in text if (32 <= ord(ch) < 127) or ch in "\n\t")
 
 
 def clean_quote(text):
     """Turn raw model output into a single typeable line."""
-    for a, b in _TRANS.items():
-        text = text.replace(a, b)
-    text = "".join(ch for ch in text if (32 <= ord(ch) < 127) or ch in "\n\t")
+    text = to_ascii(text)
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     if not lines:
         return ""
@@ -141,8 +278,13 @@ def build_prompt(mode):
     else:
         focus = ("It MUST use at least three contractions (you're, you've, I'd, it's, don't), "
                  "several commas, and at least one semicolon. ")
+    struggle = top_struggle_words(limit=8)
+    practice = ""
+    if struggle:
+        words = ", ".join(w["word"] for w in struggle[:5])
+        practice = "It MUST naturally include these words the writer struggles to type: {}. ".format(words)
     tail = "Output ONLY the quote text on a single line: no quotation marks, no preamble, no markdown."
-    return base + focus + tail
+    return base + focus + practice + tail
 
 
 def claude_available():
@@ -174,10 +316,575 @@ def generate_quote(mode, holder=None):
 
 
 # ---------------------------------------------------------------------------
+# Book library (reading-practice mode)
+# ---------------------------------------------------------------------------
+
+
+class _TextExtractor(HTMLParser):
+    """Strips HTML/XHTML tags to plain text; skips <script>/<style>; treats
+    block-level tags as paragraph breaks so the sentence splitter has
+    boundaries to work with.
+
+    include_images: turn <img> into a typeable "(image: alt)" placeholder
+                    instead of dropping it silently.
+    include_code:   keep the contents of <pre> blocks. Inline <code> inside a
+                    sentence is always kept -- it is part of the prose."""
+
+    _BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "blockquote", "pre"}
+    _MUTE = ("script", "style")
+
+    def __init__(self, include_images=False, include_code=True):
+        super().__init__(convert_charrefs=True)
+        self._chunks = []
+        self._mute = 0
+        self._pre = 0
+        self.include_images = include_images
+        self.include_code = include_code
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._MUTE:
+            self._mute += 1
+        if tag == "pre":
+            self._pre += 1
+        if tag in self._BLOCK:
+            self._chunks.append("\n")
+        if tag == "img" and self.include_images and not self._mute:
+            alt = dict(attrs).get("alt") or ""
+            alt = " ".join(alt.split())
+            self._chunks.append("\n(image{})\n".format(": " + alt if alt else ""))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag in self._MUTE and self._mute:
+            self._mute -= 1
+        if tag == "pre" and self._pre:
+            self._pre -= 1
+            self._chunks.append("\n")
+
+    def handle_data(self, data):
+        if self._mute:
+            return
+        if self._pre and not self.include_code:
+            return
+        self._chunks.append(data)
+
+    def text(self):
+        return "".join(self._chunks)
+
+
+def extract_txt(path):
+    """Read a .txt file, tolerating non-UTF8 encodings (Gutenberg-style Latin-1/cp1252)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def _epub_opf_path(zf):
+    names = zf.namelist()
+    try:
+        container = ET.fromstring(zf.read("META-INF/container.xml"))
+        rootfile = container.find(".//{*}rootfile")
+        if rootfile is not None:
+            opf_path = rootfile.get("full-path")
+            if opf_path and opf_path in names:
+                return opf_path
+    except Exception:
+        pass
+    candidates = [n for n in names if n.lower().endswith(".opf")]
+    if not candidates:
+        raise ValueError("could not locate OPF package in EPUB")
+    return candidates[0]
+
+
+def extract_epub(path, include_images=False, include_code=True):
+    """Extract reading-order plain text from an EPUB using only zipfile + ElementTree + HTMLParser."""
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+        opf_path = _epub_opf_path(zf)
+        opf_root = ET.fromstring(zf.read(opf_path))
+        manifest = {item.get("id"): item.get("href")
+                    for item in opf_root.findall(".//{*}item") if item.get("id")}
+        spine = [ir.get("idref") for ir in opf_root.findall(".//{*}itemref")
+                 if ir.get("linear") != "no"]
+
+        opf_dir = posixpath.dirname(opf_path)
+        parts = []
+        for idref in spine:
+            href = manifest.get(idref)
+            if not href:
+                continue
+            full = posixpath.normpath(posixpath.join(opf_dir, unquote(href)))
+            if full not in names:
+                continue
+            ex = _TextExtractor(include_images=include_images, include_code=include_code)
+            try:
+                ex.feed(zf.read(full).decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            parts.append(ex.text())
+        return "\n\n".join(parts)
+
+
+def extract_epub_meta(path, fallback_title):
+    """Best-effort (title, author) from the EPUB's OPF metadata in one pass.
+    Title falls back to the given stem; author is None when absent."""
+    def _text(root, tag):
+        el = root.find(".//{{*}}{}".format(tag))
+        return el.text.strip() if (el is not None and el.text and el.text.strip()) else None
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            opf_root = ET.fromstring(zf.read(_epub_opf_path(zf)))
+            return _text(opf_root, "title") or fallback_title, _text(opf_root, "creator")
+    except Exception:
+        return fallback_title, None
+
+
+def extract_pdf(path):
+    """Extract text from a PDF via pdfminer.six (optional dependency, imported lazily)."""
+    try:
+        from pdfminer.high_level import extract_text
+    except ImportError:
+        raise RuntimeError("PDF support needs pdfminer.six: pip install pdfminer.six")
+    try:
+        return extract_text(path)
+    except Exception as e:
+        raise RuntimeError("could not read this PDF (encrypted or unsupported): {}".format(e))
+
+
+def extract_ebook_text(path, include_images=False, include_code=True):
+    """Dispatch by file extension. Returns raw extracted text (not yet sanitised).
+
+    The image/code options only apply to EPUB, the one format that marks them up
+    explicitly; plain text and PDF carry no reliable signal to detect either."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".txt":
+        return extract_txt(path)
+    if ext == ".epub":
+        return extract_epub(path, include_images=include_images, include_code=include_code)
+    if ext == ".pdf":
+        return extract_pdf(path)
+    raise ValueError("unsupported file type: {}".format(ext or "(none)"))
+
+
+_SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])")
+
+
+def split_into_lines(text):
+    """Sanitise to ASCII, then split into roughly-one-sentence chunks, never
+    crossing a paragraph boundary. A small abbreviation guard re-merges the
+    worst offenders (Mr., Dr., etc.) that a plain regex would cut apart."""
+    text = to_ascii(text.replace("\x0c", "\n\n"))  # pdfminer page-break -> paragraph break
+    paras = re.split(r"\n\s*\n", text)
+    lines = []
+    for para in paras:
+        para = " ".join(para.split())
+        if not para:
+            continue
+        for piece in _SENT_RE.split(para):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if lines and lines[-1].lower().split(" ")[-1].strip() in ABBREVIATIONS:
+                lines[-1] = lines[-1] + " " + piece
+            else:
+                lines.append(piece)
+    return lines
+
+
+def chunk_into_pages(lines, lines_per_page=LINES_PER_PAGE):
+    """Group consecutive lines into fixed-size pages; merge a too-short
+    trailing remainder into the previous page instead of leaving a near-empty
+    final page."""
+    pages = [lines[i:i + lines_per_page] for i in range(0, len(lines), lines_per_page)]
+    if len(pages) >= 2 and sum(len(l) for l in pages[-1]) < MIN_TRAILING_PAGE_CHARS:
+        pages[-2] = pages[-2] + pages[-1]
+        pages.pop()
+    return pages
+
+
+def advance_progress(page_lines, current_line, typed_len):
+    """Given the CURRENT page's lines, the line the round started from, and
+    how many characters of the (line-sliced) target were typed, return
+    (page_finished, new_current_line). Always rounds down to the last fully
+    completed line -- a round never resumes mid-sentence."""
+    remaining = page_lines[current_line:]
+    consumed = 0
+    lines_done = 0
+    for line in remaining:
+        end_of_line = consumed + len(line)  # end of THIS line, not counting the separator after it
+        if typed_len >= end_of_line:
+            lines_done += 1
+            consumed = end_of_line + 1  # skip the joining space before the next line
+        else:
+            break
+    new_current_line = current_line + lines_done
+    return new_current_line >= len(page_lines), new_current_line
+
+
+def combined_lines_for_span(pages, start_page, start_line, span):
+    """Flatten lines from start_page (starting at start_line) through
+    start_page+span-1 (clamped to the book's length) into one list, with a
+    parallel list mapping each flattened line back to its (page, line).
+    Returns (flat_lines, boundaries, end_page)."""
+    flat = []
+    boundaries = []
+    end_page = min(len(pages), start_page + span)
+    for p in range(start_page, end_page):
+        page_lines = pages[p]
+        li0 = start_line if p == start_page else 0
+        for li in range(li0, len(page_lines)):
+            flat.append(page_lines[li])
+            boundaries.append((p, li))
+    return flat, boundaries, end_page
+
+
+_schema_ready = False
+
+
+def _init_schema(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            path         TEXT NOT NULL UNIQUE,
+            title        TEXT NOT NULL,
+            author       TEXT,
+            added_at     TEXT NOT NULL,
+            last_read_at TEXT,
+            wpm          REAL,
+            total_pages  INTEGER NOT NULL,
+            current_page INTEGER NOT NULL DEFAULT 0,
+            current_line INTEGER NOT NULL DEFAULT 0,
+            total_chars  INTEGER NOT NULL DEFAULT 0,
+            total_time   REAL NOT NULL DEFAULT 0,
+            pages_json   TEXT NOT NULL
+        )
+    """)
+    # Migrations for databases created by older versions.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
+    for col, decl in (("author", "TEXT"), ("last_read_at", "TEXT"), ("wpm", "REAL"),
+                       ("total_chars", "INTEGER NOT NULL DEFAULT 0"),
+                       ("total_time", "REAL NOT NULL DEFAULT 0"),
+                       ("extract_flags", "TEXT")):
+        if col not in cols:
+            conn.execute("ALTER TABLE books ADD COLUMN {} {}".format(col, decl))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS word_stats (
+            word       TEXT PRIMARY KEY,
+            attempts   INTEGER NOT NULL DEFAULT 0,
+            fails      INTEGER NOT NULL DEFAULT 0,
+            total_time REAL NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.commit()
+
+
+def get_config():
+    """All reading preferences, defaults filled in for anything unset."""
+    cfg = dict(CONFIG_DEFAULTS)
+    with _db() as conn:
+        for key, value in conn.execute("SELECT key, value FROM config"):
+            if key in cfg:
+                cfg[key] = value
+    return {k: v == "1" for k, v in cfg.items()}
+
+
+def set_config(key, enabled):
+    with _db() as conn:
+        conn.execute("INSERT INTO config(key,value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, "1" if enabled else "0"))
+        conn.commit()
+
+
+def extraction_signature(cfg):
+    """Identifies the extraction settings a book's stored text was built with,
+    so a change can be detected and the book re-extracted."""
+    return ",".join("{}={}".format(k, int(cfg[k])) for k in EXTRACTION_KEYS)
+
+
+@contextlib.contextmanager
+def _db():
+    """Open the library database, creating/migrating the schema on first use
+    only -- every helper below goes through this, so none of them repeat the
+    connect/try/finally/close dance."""
+    global _schema_ready
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if not _schema_ready:
+            _init_schema(conn)
+            _schema_ready = True
+        yield conn
+    finally:
+        conn.close()
+
+
+_DATE_WORDS = {
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+}
+
+
+# Words that are frequently capitalized mid-line -- verse capitalizes every
+# line, so without this a lot of ordinary prose would be mistaken for names.
+_NOT_NAMES = {
+    "a", "ah", "an", "and", "are", "as", "at", "away", "be", "bring", "but", "by", "call",
+    "can", "come", "could", "day", "death", "did", "die", "do", "down", "erè", "eye", "feel",
+    "find", "for", "from", "get", "give", "go", "good", "had", "hand", "has", "have", "he",
+    "hear", "heart", "her", "here", "his", "hold", "how", "i", "if", "in", "is", "it", "keep",
+    "know", "leave", "let", "like", "live", "look", "love", "madam", "make", "man", "may",
+    "men", "might", "more", "most", "must", "my", "night", "no", "nor", "not", "now", "of",
+    "on", "one", "or", "our", "out", "over", "put", "say", "see", "send", "shall", "she",
+    "should", "sir", "so", "some", "speak", "stand", "stay", "such", "take", "tell", "than",
+    "that", "the", "their", "then", "there", "they", "think", "this", "thou", "thus", "thy",
+    "time", "to", "too", "turn", "two", "under", "up", "upon", "very", "was", "we", "well",
+    "were", "what", "when", "where", "which", "who", "why", "will", "with", "woman", "word",
+    "would", "yes", "yet", "you", "your",
+}
+
+
+def looks_like_name(raw_word, sentence_start):
+    """True when a token looks like the name of a person or place: an all-caps
+    speaker cue ("BENVOLIO."), or a Title-case word appearing mid-sentence.
+    A capitalized word that opens a sentence is just ordinary prose."""
+    w = raw_word.strip(".,;:!?\"'()")
+    if len(w) < 2 or not w[:1].isalpha():
+        return False
+    letters = [c for c in w if c.isalpha()]
+    if len(letters) >= 2 and all(c.isupper() for c in letters):
+        return True                                   # BENVOLIO, CAPULET
+    if sentence_start or not (w[:1].isupper() and w[1:].islower()):
+        return False
+    if "'" in w and len(w.split("'")[0]) == 1:
+        return False                                  # I'll / I'd / I've, not a name
+    return w.split("'")[0].lower() not in _NOT_NAMES
+
+
+def _should_skip_word(raw_word, sentence_start):
+    """Struggle-word tracking skips numbers, times, dates, and names, since
+    these are one-off tokens that don't help general typing practice."""
+    w = raw_word.strip(".,;:!?\"'")
+    if not w:
+        return True
+    if any(ch.isdigit() for ch in w):  # numbers, times (3:00), most dates
+        return True
+    if w.lower() in _DATE_WORDS:
+        return True
+    return looks_like_name(raw_word, sentence_start)
+
+
+def build_skip_mask(target):
+    """Per-character mask marking the name tokens the cursor should jump over.
+    Each skipped name also swallows one adjacent space, so
+    "forget. BENVOLIO. I'll" is typed as "forget. I'll" -- exactly one space
+    between the words that remain."""
+    mask = [False] * len(target)
+    pos = 0
+    for word in target.split(" "):
+        end = pos + len(word)
+        at_sentence_start = pos == 0 or (pos >= 2 and target[pos - 2] in ".!?\"")
+        if word and looks_like_name(word, at_sentence_start):
+            for i in range(pos, end):
+                mask[i] = True
+            if end < len(target):
+                mask[end] = True          # trailing space
+            elif pos > 0:
+                mask[pos - 1] = True      # name ends the text: take the leading space
+        pos = end + 1
+    return mask
+
+
+def record_word_stats(records):
+    """records: list of (word, failed_in_oneshot: bool, elapsed_seconds: float).
+    Accumulates per-word attempt/fail/time totals across every typing session,
+    in any mode -- this is the only thing that writes to word_stats."""
+    if not records:
+        return
+    with _db() as conn:
+        for word, failed, elapsed in records:
+            clean = word.strip(".,;:!?\"'").lower()
+            if not clean:
+                continue
+            conn.execute("""
+                INSERT INTO word_stats(word, attempts, fails, total_time) VALUES (?, 1, ?, ?)
+                ON CONFLICT(word) DO UPDATE SET
+                    attempts = attempts + 1,
+                    fails = fails + excluded.fails,
+                    total_time = total_time + excluded.total_time
+            """, (clean, 1 if failed else 0, min(elapsed, MAX_WORD_SECONDS)))
+        conn.commit()
+
+
+def top_struggle_words(limit=50):
+    """Words the user fails on, slowest average first."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT word, attempts, fails, total_time FROM word_stats "
+            "WHERE fails > 0 AND attempts > 0 ORDER BY (total_time / attempts) DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(word=r[0], attempts=r[1], fails=r[2],
+                 avg_time=(r[3] / r[1] if r[1] else 0.0)) for r in rows]
+
+
+def add_or_get_book(path):
+    """Resume an existing row by (normalised) path, or extract+chunk+insert a
+    new one. Returns book_id. Raises FileNotFoundError/ValueError/RuntimeError
+    on bad input -- callers must catch and show a friendly message."""
+    path = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    if os.path.splitext(path)[1].lower() not in BOOK_EXTS:
+        raise ValueError("unsupported file type (need .txt, .epub or .pdf)")
+    cfg = get_config()
+    with _db() as conn:
+        row = conn.execute("SELECT id FROM books WHERE path=?", (path,)).fetchone()
+        if row:
+            return row[0]
+        pages = _extract_pages(path, cfg)
+        stem = os.path.splitext(os.path.basename(path))[0].replace("_", " ")
+        title, author = extract_epub_meta(path, stem) if path.lower().endswith(".epub") else (stem, None)
+        cur = conn.execute(
+            "INSERT INTO books(path,title,author,added_at,total_pages,current_page,current_line,"
+            "pages_json,extract_flags) VALUES (?,?,?,?,?,0,0,?,?)",
+            (path, title, author, time.strftime("%Y-%m-%d %H:%M:%S"), len(pages),
+             json.dumps(pages), extraction_signature(cfg)),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def _extract_pages(path, cfg):
+    raw = extract_ebook_text(path, include_images=cfg["show_images"],
+                             include_code=cfg["include_code"])
+    lines = split_into_lines(raw)
+    if not lines:
+        raise ValueError("no readable text found in this file")
+    return chunk_into_pages(lines)
+
+
+def reextract_book(book_id):
+    """Rebuild a book's pages under the current image/code settings, keeping the
+    reader on the same page number (clamped, since boundaries may shift).
+    Returns True if the text was rebuilt, False if the source file is gone."""
+    cfg = get_config()
+    with _db() as conn:
+        row = conn.execute("SELECT path, current_page FROM books WHERE id=?", (book_id,)).fetchone()
+    if row is None:
+        return False
+    path, current_page = row
+    if not os.path.isfile(path):
+        return False
+    pages = _extract_pages(path, cfg)
+    with _db() as conn:
+        conn.execute("UPDATE books SET pages_json=?, total_pages=?, extract_flags=?, "
+                     "current_page=?, current_line=0 WHERE id=?",
+                     (json.dumps(pages), len(pages), extraction_signature(cfg),
+                      min(current_page, max(0, len(pages) - 1)), book_id))
+        conn.commit()
+    return True
+
+
+# Everything about a book except the (potentially multi-megabyte) page text.
+_META_COLS = ("id", "title", "author", "current_page", "current_line", "total_pages",
+              "added_at", "last_read_at", "wpm", "total_chars", "total_time", "path",
+              "extract_flags")
+
+
+def _meta_row(row):
+    return dict(zip(_META_COLS, row))
+
+
+def list_books():
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT {} FROM books ORDER BY added_at DESC, id DESC".format(", ".join(_META_COLS))
+        ).fetchall()
+    return [_meta_row(r) for r in rows]
+
+
+def load_book_meta(book_id):
+    """Book row WITHOUT pages_json. Use this anywhere the page text is not
+    needed (menus, status lines) -- load_book() has to JSON-parse the whole
+    book, which is wasteful to do on every screen redraw."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT {} FROM books WHERE id=?".format(", ".join(_META_COLS)), (book_id,)
+        ).fetchone()
+    return _meta_row(row) if row else None
+
+
+def load_book(book_id):
+    """Full book including its parsed pages. Only needed when actually reading."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT {}, pages_json FROM books WHERE id=?".format(", ".join(_META_COLS)), (book_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    book = _meta_row(row[:-1])
+    book["pages"] = json.loads(row[-1])
+    return book
+
+
+def save_progress(book_id, current_page, current_line, total_chars=None, total_time=None):
+    """total_chars/total_time, when given, are the book's new CUMULATIVE totals
+    (not deltas) -- wpm is derived from them and never resets across rounds."""
+    with _db() as conn:
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        if total_chars is not None and total_time is not None:
+            # Same clamp as the live display: a couple of very fast keystrokes over
+            # a near-zero interval otherwise persists an absurd rate into the list.
+            wpm = min((total_chars / 5) / (total_time / 60), MAX_DISPLAY_WPM) if total_time > 0 else 0
+            conn.execute(
+                "UPDATE books SET current_page=?, current_line=?, last_read_at=?, "
+                "total_chars=?, total_time=?, wpm=? WHERE id=?",
+                (current_page, current_line, now, total_chars, total_time, wpm, book_id))
+        else:
+            conn.execute(
+                "UPDATE books SET current_page=?, current_line=?, last_read_at=? WHERE id=?",
+                (current_page, current_line, now, book_id))
+        conn.commit()
+
+
+def progress_pct(current_page, total_pages):
+    """Overall completion percentage, shown identically everywhere."""
+    return int(current_page * 100 / total_pages) if total_pages else 0
+
+
+def short_folder(path):
+    """Abbreviate a book's folder for compact display: ~ for home, ellipsis for deep paths."""
+    d = os.path.dirname(path)
+    home = os.path.expanduser("~")
+    if d == home:
+        return "~"
+    if d.startswith(home + os.sep):
+        d = "~" + d[len(home):]
+    parts = d.split("/")
+    if len(parts) > 3:
+        d = "/".join([parts[0], "...", parts[-1]])
+    return d
+
+
+def delete_book(book_id):
+    with _db() as conn:
+        conn.execute("DELETE FROM books WHERE id=?", (book_id,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Curses helpers
 # ---------------------------------------------------------------------------
 
-P_DIM, P_GOOD, P_BAD, P_ACCENT, P_WARN, P_OK = 1, 2, 3, 4, 5, 6
+P_DIM, P_GOOD, P_BAD, P_ACCENT, P_WARN, P_OK, P_SKIP = 1, 2, 3, 4, 5, 6, 7
 
 
 def init_colors():
@@ -189,6 +896,9 @@ def init_colors():
     curses.init_pair(P_ACCENT, curses.COLOR_CYAN, -1)
     curses.init_pair(P_WARN, curses.COLOR_YELLOW, -1)
     curses.init_pair(P_OK, curses.COLOR_GREEN, -1)
+    # Skipped names need their own colour: reusing the dim white of not-yet-typed
+    # text would make "you don't type this" indistinguishable from "not there yet".
+    curses.init_pair(P_SKIP, curses.COLOR_BLUE, -1)
 
 
 def safe_add(stdscr, y, x, text, attr=0):
@@ -202,7 +912,10 @@ def safe_add(stdscr, y, x, text, attr=0):
 
 
 def layout(target, width):
-    """Map each char index of target to (row, col) using word wrapping."""
+    """Map each char index of target to (row, col) using word wrapping.
+
+    Every index gets a cell of its own; no two indices may share one, or the
+    later character would overwrite the earlier one when drawn."""
     positions = {}
     words = []
     idx = 0
@@ -214,13 +927,21 @@ def layout(target, width):
         wlen = len(w)
         if col > 0:  # the space before this word lives at index start-1
             if col + 1 + wlen > width:
-                positions[start - 1] = (row, min(col, width - 1))
+                # Wrapping. The space only gets a cell if the row has room left;
+                # when the previous word ended flush against the margin the line
+                # break itself stands in for it. (Placing it at width-1 here would
+                # land on top of that word's final character and erase it.)
+                if col < width:
+                    positions[start - 1] = (row, col)
                 row += 1
                 col = 0
             else:
                 positions[start - 1] = (row, col)
                 col += 1
         for j in range(wlen):
+            if col >= width:      # word longer than the whole line: wrap inside it
+                row += 1
+                col = 0
             positions[start + j] = (row, col)
             col += 1
     return positions
@@ -243,30 +964,84 @@ def menu_screen(stdscr, settings):
         y += 1
         safe_add(stdscr, y, m, "A fresh quote is written for you each round by claude.", curses.A_DIM)
         y += 2
-        safe_add(stdscr, y, m, "time   {}s".format(settings["time"]), curses.color_pair(P_OK) | curses.A_BOLD)
-        y += 1
+        if settings["mode"] != "read":
+            safe_add(stdscr, y, m, "time   {}s".format(settings["time"]), curses.color_pair(P_OK) | curses.A_BOLD)
+            y += 1
         safe_add(stdscr, y, m, "mode   {}".format(settings["mode"]), curses.color_pair(P_OK) | curses.A_BOLD)
         y += 1
-        ai_on = settings["ai"] and claude_available()
-        ai_txt = "claude" if ai_on else ("off" if not settings["ai"] else "unavailable -> built-in")
-        safe_add(stdscr, y, m, "quotes {}".format(ai_txt), curses.color_pair(P_OK) | curses.A_BOLD)
-        y += 2
+        if settings["mode"] == "read":
+            book = load_book_meta(settings["book_id"]) if settings.get("book_id") is not None else None
+            if book:
+                safe_add(stdscr, y, m, "book   {} (p.{}/{})".format(
+                    book["title"], book["current_page"] + 1, book["total_pages"]),
+                    curses.color_pair(P_OK) | curses.A_BOLD)
+            else:
+                safe_add(stdscr, y, m, "book   (none yet -- press b to add)", curses.color_pair(P_WARN) | curses.A_BOLD)
+            y += 1
+        else:
+            ai_on = settings["ai"] and claude_available()
+            ai_txt = "claude" if ai_on else ("off" if not settings["ai"] else "unavailable -> built-in")
+            safe_add(stdscr, y, m, "quotes {}".format(ai_txt), curses.color_pair(P_OK) | curses.A_BOLD)
+            y += 1
+        y += 1
         safe_add(stdscr, y, m, "[Enter] start", curses.A_BOLD)
         y += 1
-        safe_add(stdscr, y, m, "[t] time   [m] mode   [a] AI on/off   [q] quit", curses.A_DIM)
+        if settings["mode"] == "read":
+            safe_add(stdscr, y, m, "[m] mode   [b] books   [l] list   [c] settings   [^F] struggle words   [q] quit", curses.A_DIM)
+        else:
+            safe_add(stdscr, y, m, "[t] time   [m] mode   [a] AI on/off   [c] settings   [^F] struggle words   [q] quit", curses.A_DIM)
         stdscr.refresh()
         ch = stdscr.getch()
-        if ch in (10, 13, curses.KEY_ENTER):
+        if ch in ENTER_KEYS:
             return "start"
-        if ch in (ord("t"), ord("T")):
+        if ch in (ord("t"), ord("T")) and settings["mode"] != "read":
             times = sorted(set(TIMES + [settings["time"]]))
             settings["time"] = times[(times.index(settings["time"]) + 1) % len(times)]
         elif ch in (ord("m"), ord("M")):
             settings["mode"] = MODES[(MODES.index(settings["mode"]) + 1) % len(MODES)]
-        elif ch in (ord("a"), ord("A")):
+            settings["book_id"] = None
+            settings["read_page_span"] = 1
+        elif ch in (ord("a"), ord("A")) and settings["mode"] != "read":
             settings["ai"] = not settings["ai"]
+        elif ch in (ord("b"), ord("B")) and settings["mode"] == "read":
+            library_screen(stdscr, settings)
+        elif ch in (ord("l"), ord("L")) and settings["mode"] == "read":
+            book_list_screen(stdscr, settings)
+        elif ch in (ord("c"), ord("C")):
+            # Same screen Ctrl+C opens while reading; plain 'c' here because the
+            # menu runs in cbreak mode where Ctrl+C is SIGINT.
+            if config_screen(stdscr) and settings.get("book_id") is not None:
+                apply_config_change(stdscr, settings["book_id"])
+        elif ch == CTRL_F:
+            word_stats_screen(stdscr)
         elif ch in (ord("q"), ord("Q"), 27):
             return "quit"
+
+
+def spin_while(stdscr, work, message, cancel_hint=None):
+    """Run `work` (a no-arg callable) on a daemon thread while animating a
+    spinner. Returns True if it finished, False if the user pressed Esc.
+    Shared by every background operation so the animation lives in one place."""
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    stdscr.nodelay(True)
+    i = 0
+    try:
+        while t.is_alive():
+            stdscr.erase()
+            h, _w = stdscr.getmaxyx()
+            safe_add(stdscr, h // 2, MARGIN, "{}  {}".format(message, SPINNER_FRAMES[i % len(SPINNER_FRAMES)]),
+                     curses.color_pair(P_ACCENT) | curses.A_BOLD)
+            if cancel_hint:
+                safe_add(stdscr, h // 2 + 2, MARGIN, cancel_hint, curses.A_DIM)
+            stdscr.refresh()
+            if stdscr.getch() == 27 and cancel_hint:
+                return False
+            time.sleep(SPINNER_SLEEP)
+            i += 1
+        return True
+    finally:
+        stdscr.nodelay(False)
 
 
 def loading_screen(stdscr, settings):
@@ -277,54 +1052,396 @@ def loading_screen(stdscr, settings):
     def work():
         result["q"], result["src"] = generate_quote(settings["mode"], holder=holder)
 
-    t = threading.Thread(target=work, daemon=True)
-    t.start()
-    stdscr.nodelay(True)
-    frames = "|/-\\"
-    i = 0
-    while t.is_alive():
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        safe_add(stdscr, h // 2 - 1, 4, "writing a fresh quote with claude  {}".format(frames[i % 4]),
-                 curses.color_pair(P_ACCENT) | curses.A_BOLD)
-        safe_add(stdscr, h // 2 + 1, 4, "[Esc] skip and use a built-in quote", curses.A_DIM)
-        stdscr.refresh()
-        ch = stdscr.getch()
-        if ch == 27:
-            proc = holder.get("proc")
-            if proc is not None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            return random.choice(pool(settings["mode"])), "offline"
-        time.sleep(0.08)
-        i += 1
+    finished = spin_while(stdscr, work, "writing a fresh quote with claude",
+                          "[Esc] skip and use a built-in quote")
+    if not finished:
+        proc = holder.get("proc")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        return random.choice(pool(settings["mode"])), "offline"
     return result.get("q") or random.choice(pool(settings["mode"])), result.get("src", "offline")
 
 
-def draw_test(stdscr, target, typed, time_left, wpm, acc, source):
+def prompt_text(stdscr, message):
+    """Blocking single-line text input. Returns the entered string, or None on Esc."""
+    curses.curs_set(1)
+    stdscr.nodelay(False)
+    buf = ""
+    try:
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            safe_add(stdscr, h // 2 - 1, 4, message, curses.color_pair(P_ACCENT) | curses.A_BOLD)
+            avail = max(4, w - 8)
+            safe_add(stdscr, h // 2 + 1, 4, "> " + buf[-avail:])
+            stdscr.refresh()
+            ch = stdscr.get_wch()
+            code = ch if isinstance(ch, int) else (ord(ch) if len(ch) == 1 else None)
+            if code in BACKSPACE_KEYS:
+                buf = buf[:-1]
+                continue
+            if isinstance(ch, str):
+                if code == 27:
+                    return None
+                if ch in ("\n", "\r"):
+                    return buf.strip()
+                if ch.isprintable():
+                    buf += ch
+            elif ch == curses.KEY_RESIZE:
+                continue
+    finally:
+        curses.curs_set(0)
+
+
+def _import_book_with_spinner(stdscr, path):
+    """Import a book with add_or_get_book() while showing a spinner (PDF
+    extraction can take real seconds). Returns book_id, or an error string."""
+    result = {}
+
+    def work():
+        try:
+            result["id"] = add_or_get_book(path)
+        except FileNotFoundError:
+            result["error"] = "no such file: {}".format(path)
+        except Exception as e:
+            result["error"] = str(e)
+
+    spin_while(stdscr, work, "reading book")
+    return result.get("error") if "error" in result else result.get("id")
+
+
+def _scroll_window(sel, count, capacity):
+    """First visible index so that `sel` stays on screen in a list of `count`
+    items showing `capacity` at a time."""
+    if count <= capacity:
+        return 0
+    return max(0, min(sel - capacity // 2, count - capacity))
+
+
+def _list_nav(ch, sel, count):
+    """Shared up/down handling for the selectable list screens."""
+    if not count:
+        return sel
+    if ch in (curses.KEY_UP, ord("k")):
+        return (sel - 1) % count
+    if ch in (curses.KEY_DOWN, ord("j")):
+        return (sel + 1) % count
+    return sel
+
+
+def _screen_header(stdscr, title):
+    stdscr.erase()
+    safe_add(stdscr, 2, MARGIN, title, curses.color_pair(P_ACCENT) | curses.A_BOLD | curses.A_UNDERLINE)
+    return 4
+
+
+def library_screen(stdscr, settings):
+    """Manage/select books. Mutates settings['book_id'] in place."""
+    stdscr.nodelay(False)
+    sel = 0
+    error = ""
+    while True:
+        books = list_books()
+        sel = max(0, min(sel, len(books) - 1)) if books else 0
+        h, _w = stdscr.getmaxyx()
+        y = _screen_header(stdscr, "BOOK LIBRARY")
+        capacity = max(1, h - y - 4)
+        if not books:
+            safe_add(stdscr, y, MARGIN, "no books yet -- press [n] to add one", curses.A_DIM)
+            y += 1
+        else:
+            first = _scroll_window(sel, len(books), capacity)
+            for i in range(first, min(len(books), first + capacity)):
+                b = books[i]
+                line = "{} (p.{}/{}, {}%)".format(b["title"], b["current_page"] + 1, b["total_pages"],
+                                                  progress_pct(b["current_page"], b["total_pages"]))
+                safe_add(stdscr, y, MARGIN, line, curses.A_REVERSE if i == sel else 0)
+                y += 1
+            if len(books) > capacity:
+                safe_add(stdscr, y, MARGIN, "-- {}/{} --".format(sel + 1, len(books)), curses.A_DIM)
+                y += 1
+        y += 1
+        if error:
+            safe_add(stdscr, y, MARGIN, error, curses.color_pair(P_BAD))
+            y += 1
+        safe_add(stdscr, h - 1, MARGIN, "[Enter] read   [n] add new   [d] delete   [Esc] back", curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        error = ""
+        if ch in ENTER_KEYS and books:
+            settings["book_id"] = books[sel]["id"]
+            settings["read_page_span"] = 1
+            return
+        elif ch in (ord("n"), ord("N")):
+            path = prompt_text(stdscr, "path to .txt/.epub/.pdf:")
+            if path:
+                outcome = _import_book_with_spinner(stdscr, path)
+                if isinstance(outcome, str):
+                    error = outcome
+                else:
+                    settings["book_id"] = outcome
+                    settings["read_page_span"] = 1
+                    return
+        elif ch in (ord("d"), ord("D")) and books:
+            confirm = prompt_text(stdscr, "type 'yes' to delete '{}':".format(books[sel]["title"]))
+            if confirm and confirm.lower() == "yes":
+                delete_book(books[sel]["id"])
+                if settings.get("book_id") == books[sel]["id"]:
+                    settings["book_id"] = None
+                sel = max(0, sel - 1)
+        elif ch == 27:
+            return
+        else:
+            sel = _list_nav(ch, sel, len(books))
+
+
+def book_list_screen(stdscr, settings):
+    """Detailed read-progress listing: title, author, %, pages, last read
+    date, wpm, and short folder. Enter selects that book; Esc goes back."""
+    stdscr.nodelay(False)
+    sel = 0
+    while True:
+        books = list_books()
+        sel = max(0, min(sel, len(books) - 1)) if books else 0
+        h, _w = stdscr.getmaxyx()
+        y = _screen_header(stdscr, "BOOKS READ")
+        capacity = max(1, (h - y - 3) // 2)     # two rows per book
+        if not books:
+            safe_add(stdscr, y, MARGIN, "no books yet -- press [b] then [n] to add one", curses.A_DIM)
+        else:
+            first = _scroll_window(sel, len(books), capacity)
+            for i in range(first, min(len(books), first + capacity)):
+                b = books[i]
+                attr = curses.A_REVERSE if i == sel else 0
+                safe_add(stdscr, y, MARGIN,
+                         b["title"] + (" -- {}".format(b["author"]) if b["author"] else ""),
+                         attr | curses.A_BOLD)
+                y += 1
+                safe_add(stdscr, y, MARGIN, "{}%  p.{}/{}   last read {}   wpm {}   {}".format(
+                    progress_pct(b["current_page"], b["total_pages"]),
+                    b["current_page"] + 1, b["total_pages"],
+                    b["last_read_at"] or "never",
+                    int(b["wpm"]) if b["wpm"] is not None else "-",
+                    short_folder(b["path"])), attr)
+                y += 2
+            if len(books) > capacity:
+                safe_add(stdscr, y, MARGIN, "-- {}/{} --".format(sel + 1, len(books)), curses.A_DIM)
+        safe_add(stdscr, h - 1, MARGIN, "[Enter] read   up/down navigate   [Esc] back", curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in ENTER_KEYS and books:
+            settings["book_id"] = books[sel]["id"]
+            settings["read_page_span"] = 1
+            return
+        elif ch == 27:
+            return
+        else:
+            sel = _list_nav(ch, sel, len(books))
+
+
+def word_stats_screen(stdscr):
+    """Read-only listing of the words the user struggles with most, across
+    every typing session in every mode: slowest average first."""
+    stdscr.nodelay(False)
+    words = top_struggle_words()
+    sel = 0
+    while True:
+        h, _w = stdscr.getmaxyx()
+        y = _screen_header(stdscr, "WORDS YOU STRUGGLE WITH")
+        if not words:
+            safe_add(stdscr, y, MARGIN, "no data yet -- keep typing and check back here", curses.A_DIM)
+        else:
+            safe_add(stdscr, y, MARGIN, "{:<20} {:>9} {:>9} {:>10}".format(
+                "word", "avg time", "fails", "attempts"), curses.A_BOLD)
+            y += 1
+            capacity = max(1, h - y - 2)
+            first = _scroll_window(sel, len(words), capacity)
+            for i in range(first, min(len(words), first + capacity)):
+                word = words[i]
+                line = "{:<20} {:>8.1f}s {:>9} {:>10}".format(
+                    word["word"][:20], word["avg_time"], word["fails"], word["attempts"])
+                col = curses.color_pair(P_BAD) if word["fails"] >= word["attempts"] else curses.color_pair(P_WARN)
+                safe_add(stdscr, y, MARGIN, line, col | (curses.A_REVERSE if i == sel else 0))
+                y += 1
+        safe_add(stdscr, h - 1, MARGIN, "up/down scroll   [Esc] back", curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == 27:
+            return
+        sel = _list_nav(ch, sel, len(words))
+
+
+def text_area(stdscr):
+    """(width, rows) that draw_test can actually use for the target text."""
+    h, w = stdscr.getmaxyx()
+    return max(20, w - MARGIN * 2), max(1, h - BOTTOM_ROWS - TEXT_TOP)
+
+
+def rows_needed(text, width):
+    positions = layout(text, width)
+    return (max(r for r, _c in positions.values()) + 1) if positions else 0
+
+
+def text_fits(stdscr, text):
+    """Would `text`, word-wrapped at the current terminal width, fit within the
+    vertical space draw_test has for it?"""
+    width, rows = text_area(stdscr)
+    return rows_needed(text, width) <= rows
+
+
+def fit_line_count(stdscr, lines):
+    """How many of `lines` (joined by spaces) fit on screen at once. Always at
+    least 1, so a single over-long line still renders (clipped) rather than
+    leaving the user with a blank screen and nothing to type."""
+    width, rows = text_area(stdscr)
+    if not lines:
+        return 0
+    if rows_needed(" ".join(lines), width) <= rows:
+        return len(lines)
+    lo, hi = 1, len(lines)          # binary search the largest prefix that fits
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if rows_needed(" ".join(lines[:mid]), width) <= rows:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def show_message(stdscr, message, ok=False):
+    stdscr.nodelay(False)
     stdscr.erase()
     h, w = stdscr.getmaxyx()
-    margin = 4
-    text_w = max(20, w - margin * 2)
-    status = " time {:>3}s    wpm {:>3}    acc {:>3}% ".format(int(round(time_left)), int(wpm), int(acc))
-    safe_add(stdscr, 1, margin, status, curses.color_pair(P_ACCENT) | curses.A_BOLD)
-    safe_add(stdscr, 1, w - margin - 12, "Esc cancel", curses.A_DIM)
+    col = curses.color_pair(P_OK) if ok else curses.color_pair(P_BAD)
+    safe_add(stdscr, h // 2, 4, message, col | curses.A_BOLD)
+    safe_add(stdscr, h // 2 + 2, 4, "press any key to continue", curses.A_DIM)
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def config_screen(stdscr):
+    """Toggle reading preferences. Returns True if a setting that affects how
+    book text is EXTRACTED changed, so the caller can rebuild the book."""
+    stdscr.nodelay(False)
+    keys = list(CONFIG_DEFAULTS)
+    before = get_config()
+    sel = 0
+    while True:
+        h, _w = stdscr.getmaxyx()
+        y = _screen_header(stdscr, "READING SETTINGS")
+        cfg = get_config()
+        for i, key in enumerate(keys):
+            mark = "[x]" if cfg[key] else "[ ]"
+            safe_add(stdscr, y, MARGIN, "{} {}".format(mark, CONFIG_LABELS[key]),
+                     (curses.A_REVERSE if i == sel else 0) |
+                     (curses.color_pair(P_OK) if cfg[key] else curses.A_DIM))
+            y += 1
+        y += 1
+        for note in ("images and code change how a book is read from disk, so",
+                     "an already-added book is rebuilt when you change them.",
+                     "skipping names greys them out and jumps the cursor past."):
+            safe_add(stdscr, y, MARGIN, note, curses.A_DIM)
+            y += 1
+        safe_add(stdscr, h - 1, MARGIN, "up/down move   [space]/[Enter] toggle   [Esc] done", curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in ENTER_KEYS or ch == ord(" "):
+            set_config(keys[sel], not get_config()[keys[sel]])
+        elif ch == 27:
+            after = get_config()
+            return any(before[k] != after[k] for k in EXTRACTION_KEYS)
+        else:
+            sel = _list_nav(ch, sel, len(keys))
+
+
+def apply_config_change(stdscr, book_id):
+    """Rebuild a book's text after the image/code settings changed."""
+    if book_id is None:
+        return
+    done = {}
+
+    def work():
+        try:
+            done["ok"] = reextract_book(book_id)
+        except Exception as e:
+            done["err"] = str(e)
+
+    spin_while(stdscr, work, "rebuilding book with the new settings")
+    if "err" in done:
+        show_message(stdscr, "could not rebuild: {}".format(done["err"]))
+    elif not done.get("ok"):
+        show_message(stdscr, "source file is gone -- keeping the text already imported")
+
+
+def book_finished_screen(stdscr, title):
+    stdscr.nodelay(False)
+    while True:
+        stdscr.erase()
+        m = 4
+        y = 2
+        safe_add(stdscr, y, m, "You've finished '{}'!".format(title), curses.color_pair(P_OK) | curses.A_BOLD)
+        y += 2
+        safe_add(stdscr, y, m, "[Enter] restart from page 1   [q]/[Esc] back to menu", curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in ENTER_KEYS:
+            return "restart"
+        if ch in (ord("q"), ord("Q"), 27):
+            return "menu"
+
+
+READING_HINTS = ("[left]/[right] page  [^G] jump  [^P] more words  [^C] settings  "
+                 "[^L] list  [^Q] quit  [Esc] stop")
+
+
+def draw_test(stdscr, target, typed, time_left, wpm, acc, source, page_label=None,
+              book_pct=None, book_title=None, skip_mask=None):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    text_w, _rows = text_area(stdscr)
+    if page_label:
+        status = " progress {:>3}%    wpm {:>3}    acc {:>3}% ".format(book_pct or 0, int(wpm), int(acc))
+    else:
+        status = " time {:>3}s    wpm {:>3}    acc {:>3}% ".format(int(round(time_left)), int(wpm), int(acc))
+    safe_add(stdscr, 1, MARGIN, status, curses.color_pair(P_ACCENT) | curses.A_BOLD)
+    if page_label and book_title:
+        # Right-aligned, but never overlapping the status block; truncate if the
+        # terminal is too narrow to hold both.
+        room = w - MARGIN - (MARGIN + len(status) + 2)
+        shown = book_title if len(book_title) <= room else book_title[:max(0, room - 1)] + "~"
+        if shown:
+            safe_add(stdscr, 1, max(MARGIN + len(status) + 2, w - MARGIN - len(shown)), shown,
+                     curses.color_pair(P_ACCENT) | curses.A_BOLD)
+    else:
+        safe_add(stdscr, 1, w - MARGIN - 12, "Esc cancel", curses.A_DIM)
     positions = layout(target, text_w)
-    top = 4
-    n = len(target)
     tlen = len(typed)
-    for i in range(n):
+    for i, ch in enumerate(target):
         pos = positions.get(i)
         if pos is None:
+            # A space swallowed by a line wrap has no cell of its own. If the
+            # cursor is sitting on it, show the cursor on the next character
+            # instead of letting it disappear at the end of the line.
+            if i == tlen:
+                nxt = positions.get(i + 1)
+                if nxt is not None:
+                    safe_add(stdscr, TEXT_TOP + nxt[0], MARGIN + nxt[1],
+                             target[i + 1], curses.A_REVERSE)
             continue
-        ch = target[i]
         r, c = pos
-        y, x = top + r, margin + c
-        if y >= h - 2:
+        y, x = TEXT_TOP + r, MARGIN + c
+        if y >= h - BOTTOM_ROWS:
             break
-        if i < tlen:
+        if skip_mask is not None and skip_mask[i]:
+            # A skipped name stays on the page in its own colour -- it is shown
+            # but never typed, so it must not look correct, wrong, or pending.
+            disp, attr = ch, curses.color_pair(P_SKIP) | curses.A_DIM
+        elif i < tlen:
             if typed[i] == ch:
                 disp, attr = ch, curses.color_pair(P_GOOD) | curses.A_BOLD
             elif ch == " ":
@@ -336,61 +1453,204 @@ def draw_test(stdscr, target, typed, time_left, wpm, acc, source):
         else:
             disp, attr = ch, curses.color_pair(P_DIM) | curses.A_DIM
         safe_add(stdscr, y, x, disp, attr)
-    pct = int(tlen * 100 / n) if n else 0
-    safe_add(stdscr, h - 2, margin, "progress {}%    quote: {}".format(pct, source), curses.A_DIM)
+    if page_label:
+        safe_add(stdscr, h - 2, MARGIN, page_label, curses.color_pair(P_ACCENT) | curses.A_BOLD)
+        safe_add(stdscr, h - 1, MARGIN, READING_HINTS, curses.A_DIM)
+        if skip_mask is not None and any(skip_mask):
+            safe_add(stdscr, h - 2, w - MARGIN - 18, "names skipped", curses.A_DIM)
+    else:
+        pct = int(tlen * 100 / len(target)) if target else 0
+        safe_add(stdscr, h - 2, MARGIN, "progress {}%    quote: {}".format(pct, source), curses.A_DIM)
     stdscr.refresh()
 
 
-def run_test(stdscr, target, source, settings):
-    """Returns a result dict, or None if the user pressed Esc."""
+_NAV_KEYS = (curses.KEY_LEFT, curses.KEY_RIGHT)
+_CTRL_NAV_KEYS = (CTRL_C, CTRL_G, CTRL_L, CTRL_P, CTRL_Q)
+
+
+def run_test(stdscr, target, source, settings, progress_holder=None, untimed=False,
+             page_label=None, book_nav=False, book_pct=None, book_title=None,
+             base_chars=0, base_time=0.0, skip_mask=None):
+    """Returns a result dict, or None if the user pressed Esc.
+
+    base_chars/base_time (book mode only): the book's persisted cumulative
+    totals so far. WPM is shown as a running average that starts from this
+    baseline immediately (never 0 on a fresh page) and freezes -- rather than
+    decaying -- whenever the user stops typing, since elapsed time is only
+    advanced up to the last keystroke, not to wall-clock "now"."""
     typed = []
     start = None
+    last_activity = None
     total_keys = 0
     error_keys = 0
+    correct = 0          # maintained incrementally; recomputing it every frame was O(len(target))
+
+    # Per-word struggle tracking. char_word[i] is the index of the word covering
+    # character i (or -1 for the separators), so the hot path is a list lookup
+    # rather than a scan over every word boundary on each keystroke.
+    word_bounds = []
+    char_word = [-1] * len(target)
+    _pos = 0
+    for _wi, _w in enumerate(target.split(" ")):
+        word_bounds.append((_pos, _pos + len(_w)))
+        for _j in range(_pos, min(_pos + len(_w), len(target))):
+            char_word[_j] = _wi
+        _pos += len(_w) + 1
+    word_start_time = {}
+    word_error = {}
+    word_done = set()
+    word_records = []  # (word_text, failed_in_oneshot, elapsed_seconds)
+
+    def _is_sentence_start(wi):
+        at = word_bounds[wi][0]
+        return at == 0 or (at >= 2 and target[at - 2] in ".!?\"")
+
+    def _finish(nav=None):
+        """Single exit path: flush word stats and publish this round's numbers."""
+        record_word_stats(word_records)
+        if progress_holder is not None:
+            progress_holder["typed_len"] = len(typed)
+            progress_holder["wpm"] = wpm
+            progress_holder["round_correct"] = correct
+            progress_holder["round_time"] = active_elapsed
+            if nav is not None:
+                progress_holder["nav"] = nav
+
+    def _read_arrow():
+        """Some terminals deliver an arrow key as raw bytes (ESC, '[', letter)
+        instead of a pre-translated KEY_* code, even with keypad mode on. Peek
+        for that pattern so arrow navigation is not swallowed as a plain Esc."""
+        for _ in range(3):
+            ch2 = stdscr.getch()
+            if ch2 != -1:
+                break
+            time.sleep(0.01)
+        if ch2 != ord("["):
+            return None
+        for _ in range(3):
+            ch3 = stdscr.getch()
+            if ch3 != -1:
+                break
+            time.sleep(0.01)
+        return {ord("C"): curses.KEY_RIGHT, ord("D"): curses.KEY_LEFT}.get(ch3)
+
+    wpm = (base_chars / 5) / (base_time / 60) if (untimed and base_time > 0) else 0.0
+    active_elapsed = 0.0
+    last_frame = None
+    auto = set()          # indices filled in by name-skipping, not typed by the user
+
+    def _skip_ahead():
+        """Fill in any characters the cursor should jump over (skipped names).
+        They are recorded so they never count towards WPM or accuracy."""
+        moved = False
+        while len(typed) < len(target) and skip_mask[len(typed)]:
+            auto.add(len(typed))
+            typed.append(target[len(typed)])
+            moved = True
+        return moved
+
     stdscr.nodelay(True)
+    if book_nav:
+        curses.raw()      # so Ctrl+C reaches us as a key instead of raising SIGINT
     try:
         while True:
+            if skip_mask and _skip_ahead():
+                last_frame = None
+                if len(typed) >= len(target):
+                    break
             now = time.time()
             if start is not None:
-                elapsed = now - start
-                time_left = settings["time"] - elapsed
-                if time_left <= 0:
-                    break
+                if untimed:
+                    # Freeze at the last keystroke instead of wall-clock "now", so
+                    # pausing mid-page doesn't erode the running WPM average.
+                    active_elapsed = (last_activity - start) if last_activity else 0.0
+                else:
+                    active_elapsed = now - start
+                    if settings["time"] - active_elapsed <= 0:
+                        break
             else:
-                elapsed = 0.0
-                time_left = settings["time"]
-            correct = sum(1 for i, c in enumerate(typed) if c == target[i])
-            wpm = (correct / 5) / (elapsed / 60) if elapsed > 0 else 0
+                active_elapsed = 0.0
+            time_left = active_elapsed if untimed else settings["time"] - active_elapsed
+            if untimed:
+                combined_time = base_time + active_elapsed
+                wpm = ((base_chars + correct) / 5) / (combined_time / 60) if combined_time > 0 else 0
+            else:
+                wpm = (correct / 5) / (active_elapsed / 60) if active_elapsed > 0 else 0
+            wpm = min(wpm, MAX_DISPLAY_WPM)
             acc = (total_keys - error_keys) / total_keys * 100 if total_keys else 100
-            draw_test(stdscr, target, typed, time_left, wpm, acc, source)
+
+            # Only repaint when something the user can actually see has changed --
+            # redrawing every target character 30x/second is pure waste while idle.
+            frame = (len(typed), int(round(time_left)), int(wpm), int(acc))
+            if frame != last_frame:
+                draw_test(stdscr, target, typed, time_left, wpm, acc, source, page_label=page_label,
+                          book_pct=book_pct, book_title=book_title, skip_mask=skip_mask)
+                last_frame = frame
+
             ch = stdscr.getch()
             if ch == -1:
-                time.sleep(0.03)
+                time.sleep(FRAME_SLEEP)
                 continue
             if ch == 27:
+                nav_ch = _read_arrow() if book_nav else None
+                _finish(nav=nav_ch)
                 return None
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                if typed:
+            if book_nav and (ch in _NAV_KEYS or ch in _CTRL_NAV_KEYS):
+                _finish(nav=ch)
+                return None
+            if ch in BACKSPACE_KEYS:
+                # Refuse to reverse into a skipped name -- the user never typed it.
+                if typed and (len(typed) - 1) not in auto:
+                    if typed[-1] == target[len(typed) - 1]:
+                        correct -= 1
                     typed.pop()
+                    last_frame = None
                 continue
             if ch == curses.KEY_RESIZE:
+                last_frame = None      # geometry changed: force a full repaint
                 continue
             if 32 <= ch <= 126:
+                i = len(typed)
+                if i >= len(target):
+                    continue
                 if start is None:
                     start = time.time()
-                i = len(typed)
-                if i < len(target):
-                    c = chr(ch)
-                    typed.append(c)
-                    total_keys += 1
-                    if c != target[i]:
-                        error_keys += 1
-                    if len(typed) >= len(target):
-                        break
+                last_activity = time.time()
+                c = chr(ch)
+                wi = char_word[i] if i < len(char_word) else -1
+                if wi >= 0 and wi not in word_start_time:
+                    word_start_time[wi] = last_activity
+                typed.append(c)
+                total_keys += 1
+                if c == target[i]:
+                    correct += 1
+                else:
+                    error_keys += 1
+                    if wi >= 0:
+                        word_error[wi] = True
+                if wi >= 0 and len(typed) >= word_bounds[wi][1] and wi not in word_done:
+                    word_done.add(wi)
+                    word_text = target[word_bounds[wi][0]:word_bounds[wi][1]]
+                    if not _should_skip_word(word_text, _is_sentence_start(wi)):
+                        word_records.append((word_text, word_error.get(wi, False),
+                                             last_activity - word_start_time[wi]))
+                if len(typed) >= len(target):
+                    break
     finally:
         stdscr.nodelay(False)
+        if book_nav:
+            curses.noraw()
+            curses.cbreak()
+
     elapsed = (time.time() - start) if start else 0.0
-    return analyze(target, typed, elapsed, total_keys, error_keys, source, settings)
+    if untimed and start and last_activity:
+        active_elapsed = last_activity - start
+    else:
+        active_elapsed = elapsed
+    result = analyze(target, typed, elapsed, total_keys, error_keys, source, settings)
+    wpm = result["wpm"]
+    _finish()
+    return result
 
 
 def analyze(target, typed, elapsed, total_keys, error_keys, source, settings):
@@ -476,7 +1736,7 @@ def results_screen(stdscr, r):
         safe_add(stdscr, y, m, "[Enter] again    [s] settings    [q] quit", curses.A_DIM)
         stdscr.refresh()
         ch = stdscr.getch()
-        if ch in (10, 13, curses.KEY_ENTER):
+        if ch in ENTER_KEYS:
             return "again"
         if ch in (ord("s"), ord("S")):
             return "menu"
@@ -491,11 +1751,113 @@ def _run(stdscr, settings):
         if menu_screen(stdscr, settings) == "quit":
             return
         while True:
-            if settings["ai"] and claude_available():
+            if settings.get("book_id") is not None:
+                cfg = get_config()
+                meta = load_book_meta(settings["book_id"])
+                if meta is not None and meta["extract_flags"] != extraction_signature(cfg):
+                    # Imported under different image/code settings -- rebuild first.
+                    apply_config_change(stdscr, settings["book_id"])
+                book = load_book(settings["book_id"])
+                if book is None:
+                    settings["book_id"] = None
+                    continue
+                if book["current_page"] >= book["total_pages"]:
+                    action = book_finished_screen(stdscr, book["title"])
+                    if action == "restart":
+                        save_progress(settings["book_id"], 0, 0)
+                        continue
+                    break
+                page = book["current_page"]
+                span = max(1, min(settings.get("read_page_span", 1), book["total_pages"] - page))
+                cur_line = min(book["current_line"], len(book["pages"][page]))
+                flat_lines, boundaries, end_page = combined_lines_for_span(
+                    book["pages"], page, cur_line, span)
+                if not " ".join(flat_lines).strip():
+                    save_progress(settings["book_id"], page + 1, 0)
+                    continue
+                # Never show more than the window can display: anything typed off
+                # the bottom edge would be invisible but still required. The
+                # remainder is simply picked up by the next round.
+                shown = flat_lines[:max(1, fit_line_count(stdscr, flat_lines))]
+                boundaries = boundaries[:len(shown)]
+                target = " ".join(shown)
+                if not text_fits(stdscr, target):
+                    # Even a single sentence cannot be displayed -- refuse rather
+                    # than ask the user to type text they cannot see.
+                    show_message(stdscr, "window too small to show a line of text -- resize and try again")
+                    break
+                last_page_shown = boundaries[-1][0] if boundaries else page
+                page_label = ("page {}/{}".format(page + 1, book["total_pages"])
+                              if last_page_shown == page else
+                              "page {}-{}/{}".format(page + 1, last_page_shown + 1, book["total_pages"]))
+                source = "book: {} p.{}/{}".format(book["title"], page + 1, book["total_pages"])
+                holder = {}
+                result = run_test(stdscr, target, source, settings, progress_holder=holder,
+                                   untimed=True, page_label=page_label, book_nav=True,
+                                   book_pct=progress_pct(page, book["total_pages"]), book_title=book["title"],
+                                   base_chars=book["total_chars"], base_time=book["total_time"],
+                                   skip_mask=build_skip_mask(target) if cfg["skip_names"] else None)
+                chars = book["total_chars"] + holder.get("round_correct", 0)
+                secs = book["total_time"] + holder.get("round_time", 0.0)
+
+                def go(target_page, target_line=0):
+                    save_progress(settings["book_id"], target_page, target_line,
+                                  total_chars=chars, total_time=secs)
+
+                nav = holder.get("nav")
+                if nav == curses.KEY_RIGHT:
+                    # Arrow navigation always marks what is on screen complete and
+                    # moves on -- no partial-line credit (that only matters for Esc,
+                    # where resuming mid-page is the point).
+                    go(min(book["total_pages"] - 1, last_page_shown + 1))
+                elif nav == curses.KEY_LEFT:
+                    go(max(0, page - span))
+                elif nav == CTRL_G:
+                    answer = prompt_text(stdscr, "jump to page (1-{}):".format(book["total_pages"]))
+                    if answer and answer.strip().isdigit():
+                        go(max(0, min(book["total_pages"] - 1, int(answer.strip()) - 1)))
+                    else:
+                        go(page, cur_line)
+                else:
+                    finished, idx = advance_progress(shown, 0, holder.get("typed_len", 0))
+                    go(*((last_page_shown + 1, 0) if finished else boundaries[idx]))
+
+                if nav == CTRL_C:
+                    if config_screen(stdscr):
+                        apply_config_change(stdscr, settings["book_id"])
+                    continue
+                if nav == CTRL_L:
+                    book_list_screen(stdscr, settings)
+                    if settings.get("book_id") is None:
+                        break
+                    continue
+                if nav == CTRL_P:
+                    if end_page >= book["total_pages"] and len(shown) == len(flat_lines):
+                        show_message(stdscr, "already showing to the end of the book")
+                    else:
+                        trial, _b, _e = combined_lines_for_span(
+                            book["pages"], page, cur_line, span + 1)
+                        if len(shown) < len(flat_lines) or not text_fits(stdscr, " ".join(trial)):
+                            show_message(stdscr, "error: text does not fit in the window")
+                        else:
+                            settings["read_page_span"] = span + 1
+                    continue
+                if nav == CTRL_Q:
+                    return
+                if nav is None and result is None:
+                    break  # Esc -- stop the session, back to menu
+                continue  # page complete (or navigated) -- straight into the next round
+            elif settings["mode"] == "read":
+                library_screen(stdscr, settings)
+                if settings.get("book_id") is None:
+                    break
+                continue
+            elif settings["ai"] and claude_available():
                 target, source = loading_screen(stdscr, settings)
+                result = run_test(stdscr, target, source, settings)
             else:
                 target, source = random.choice(pool(settings["mode"])), "offline"
-            result = run_test(stdscr, target, source, settings)
+                result = run_test(stdscr, target, source, settings)
             if result is None:
                 break
             action = results_screen(stdscr, result)
@@ -511,10 +1873,23 @@ def main():
         description="Terminal typing trainer for English punctuation and contractions. Quotes by claude -p.",
     )
     p.add_argument("-t", "--time", type=int, default=60, help="seconds per test (default 60)")
-    p.add_argument("-m", "--mode", choices=MODES, default="mixed", help="quote focus (default mixed)")
+    p.add_argument("-m", "--mode", choices=MODES, default="read", help="quote focus (default read/books)")
     p.add_argument("--offline", action="store_true", help="use built-in quotes instead of claude")
+    p.add_argument("--add-book", metavar="PATH",
+                   help="import (or resume) a book for reading-practice mode, print its status, and exit")
     args = p.parse_args()
-    settings = {"time": max(10, args.time), "mode": args.mode, "ai": not args.offline}
+    if args.add_book:
+        try:
+            book_id = add_or_get_book(args.add_book)
+            b = load_book(book_id)
+            print("book id {}: {}  (page {}/{})".format(
+                book_id, b["title"], b["current_page"] + 1, b["total_pages"]))
+        except Exception as e:
+            print("error: {}".format(e), file=sys.stderr)
+            sys.exit(1)
+        return
+    settings = {"time": max(10, args.time), "mode": args.mode, "ai": not args.offline,
+                "book_id": None, "read_page_span": 1}
     try:
         curses.wrapper(_run, settings)
     except KeyboardInterrupt:
