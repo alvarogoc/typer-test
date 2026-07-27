@@ -1,30 +1,56 @@
 # typer-test
 
-A small terminal typing trainer for practicing **English**, focused on the
-mistakes that are easy to make as a non-native writer:
+> **Beta** — `0.1.0-beta`. Works end to end, but behaviour and the on-disk
+> database format may still change between releases. Check your version with
+> `typer-test --version`.
 
-- **punctuation** — where to put `.` `,` and `;`
-- **contractions** — `you're`, `you've`, `I'd`, `I've`, `it's`, `don't`, `that's` …
-- the always-capital **`I`**, and correct **`a` / `an`** usage
+**Read a whole book by typing it.** A terminal reading-and-typing trainer:
+point it at your own `.txt`, `.epub` or `.pdf`, and it becomes the text you
+practice on — one page at a time, remembering exactly where you left off, for
+as many sessions as the book takes.
 
-It works like [MonkeyType](https://monkeytype.com), but in your terminal: a
-quote appears in **gray**, each character turns **white** as you type it
-correctly and **red** when you slip. At the end you get your WPM, accuracy, and
-a breakdown of the punctuation and contractions you missed.
-
-Every round, a **fresh quote is written for you by `claude -p`**, tuned to the
-skill you are practising. No `claude`? It falls back to a built-in set of
-quotes, so it always works offline.
+It works like [MonkeyType](https://monkeytype.com), but in your terminal, and
+built around reading something you actually want to read instead of disposable
+drill sentences. Text appears in gray, turns white as you type it correctly and
+red when you slip.
 
 ```
-TYPER-TEST
- time 60s   wpm 72   acc 98%                              Esc cancel
+ progress  10%    wpm  74    acc 98%                        Romeo and Juliet
 
- You're stronger than you've ever guessed; don't let yesterday's doubts
- define you, because it's clear that what you're becoming is brighter.
+ Where I may read who pass'd that passing fair? Farewell, thou canst not
+ teach me to forget. BENVOLIO. I'll pay that doctrine, or else die in debt.
+ Exeunt. SCENE II. A Street. Enter Capulet, Paris and Servant. CAPULET.
 
- progress 100%    quote: claude
+ page 41/394                                                  names skipped
+ [left]/[right] page  [^G] jump  [^P] more words  [^C] settings  [^L] list
 ```
+
+What it does:
+
+- **Reads your books.** EPUB, plain text and PDF, with the title and author
+  pulled from EPUB metadata. Text is sanitised to characters you can actually
+  type on a keyboard.
+- **Never loses your place.** Page *and* line are saved every round, so you
+  resume mid-page rather than re-typing what you already did.
+- **No clock while reading.** A page stays up as long as it takes, then flips
+  to the next one automatically. Move around with the arrows, jump to any page,
+  or combine several pages into one screen.
+- **Tracks a real WPM.** A cumulative per-book average that carries across
+  sessions and freezes when you stop typing instead of decaying while you think.
+- **Learns what you're bad at.** Records every word you fumble, with fail count
+  and average time, and asks `claude` to work your slowest words into generated
+  practice quotes.
+- **Adapts to the text.** Optionally show pictures as placeholders, include or
+  skip code blocks, or grey out character names so the cursor jumps past them —
+  handy for plays and dialogue-heavy books.
+- **Fits your terminal.** Never asks you to type text that isn't on screen,
+  whatever size the window is.
+
+It also still does the original thing — short generated quotes for drilling
+English punctuation and contractions, the mistakes that are easy to make as a
+non-native writer (`.` `,` `;`, `you're` / `your`, `I'd`, `I've`, the
+always-capital `I`, `a` vs `an`). Those modes are a keypress away, and work
+offline from a built-in quote set when `claude` isn't installed.
 
 ## Requirements
 
