@@ -105,7 +105,7 @@ Controls:
   results      : Enter=again  s=settings  q=quit
 """
 
-__version__ = "0.1.0-beta"
+__version__ = "1.0.0"
 
 import argparse
 import contextlib

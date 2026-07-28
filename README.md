@@ -1,8 +1,7 @@
 # typer-test
 
-> **Beta** — `0.1.0-beta`. Works end to end, but behaviour and the on-disk
-> database format may still change between releases. Check your version with
-> `typer-test --version`.
+> `1.0.0` — check your version with `typer-test --version`. The database
+> schema migrates itself, so upgrading keeps your books and reading progress.
 
 **Read a whole book by typing it.** A terminal reading-and-typing trainer:
 point it at your own `.txt`, `.epub` or `.pdf`, and it becomes the text you
