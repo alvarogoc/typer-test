@@ -196,10 +196,11 @@ type, and finishing it automatically flips to the next page — no results
 screen in between, just continuous reading. Pressing `Esc` stops the session
 and returns to the menu. Your position (page + line) is saved every time a
 round ends, whether that's by finishing a page or pressing `Esc`, so the next
-session resumes from exactly where you stopped. Books and progress live in a
-small SQLite database at `~/.local/share/typer-test/library.db`; deleting a
-book from the library (`d`) only removes that tracking row, never the
-original file.
+session resumes from exactly where you stopped — and the book you had open is
+remembered too, so relaunching drops you straight back into it rather than an
+empty library. Books and progress live in a small SQLite database at
+`~/.local/share/typer-test/library.db`; deleting a book from the library (`d`)
+only removes that tracking row, never the original file.
 
 While actively reading, you can jump around without stopping first:
 `right` always marks the current page(s) complete (no matter how much you'd

@@ -604,11 +604,42 @@ def get_config():
 
 
 def set_config(key, enabled):
+    set_setting(key, "1" if enabled else "0")
+
+
+def set_setting(key, value):
+    """Store a raw string setting (config holds the on/off toggles plus a few
+    plain values like which book was last open)."""
     with _db() as conn:
-        conn.execute("INSERT INTO config(key,value) VALUES (?,?) "
-                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                     (key, "1" if enabled else "0"))
+        if value is None:
+            conn.execute("DELETE FROM config WHERE key=?", (key,))
+        else:
+            conn.execute("INSERT INTO config(key,value) VALUES (?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
         conn.commit()
+
+
+def get_setting(key, default=None):
+    with _db() as conn:
+        row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def remember_book(book_id):
+    """Persist which book is open so a relaunch carries straight on with it."""
+    set_setting("last_book_id", book_id)
+
+
+def last_book_id():
+    """The book that was open when the app last ran, if it still exists."""
+    raw = get_setting("last_book_id")
+    if not raw:
+        return None
+    try:
+        book_id = int(raw)
+    except ValueError:
+        return None
+    return book_id if load_book_meta(book_id) else None
 
 
 def extraction_signature(cfg):
@@ -619,14 +650,20 @@ def extraction_signature(cfg):
 
 @contextlib.contextmanager
 def _db():
-    """Open the library database, creating/migrating the schema on first use
-    only -- every helper below goes through this, so none of them repeat the
-    connect/try/finally/close dance."""
+    """Open the library database, creating/migrating the schema when needed --
+    every helper below goes through this, so none of them repeat the
+    connect/try/finally/close dance.
+
+    The schema check is cached, but a missing file always forces a rebuild: the
+    database can disappear underneath a running app (deleting the data
+    directory is the documented way to reset it), and sqlite would then happily
+    hand back a brand-new empty file with no tables in it."""
     global _schema_ready
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    fresh = not os.path.exists(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     try:
-        if not _schema_ready:
+        if fresh or not _schema_ready:
             _init_schema(conn)
             _schema_ready = True
         yield conn
@@ -1007,8 +1044,7 @@ def menu_screen(stdscr, settings):
             settings["time"] = times[(times.index(settings["time"]) + 1) % len(times)]
         elif ch in (ord("m"), ord("M")):
             settings["mode"] = MODES[(MODES.index(settings["mode"]) + 1) % len(MODES)]
-            settings["book_id"] = None
-            settings["read_page_span"] = 1
+            select_book(settings, None)
         elif ch in (ord("a"), ord("A")) and settings["mode"] != "read":
             settings["ai"] = not settings["ai"]
         elif ch in (ord("b"), ord("B")) and settings["mode"] == "read":
@@ -1121,6 +1157,14 @@ def _import_book_with_spinner(stdscr, path):
     return result.get("error") if "error" in result else result.get("id")
 
 
+def select_book(settings, book_id):
+    """Change which book is open, resetting the page span and remembering the
+    choice so the next launch carries on with it."""
+    settings["book_id"] = book_id
+    settings["read_page_span"] = 1
+    remember_book(book_id)
+
+
 def _scroll_window(sel, count, capacity):
     """First visible index so that `sel` stays on screen in a list of `count`
     items showing `capacity` at a time."""
@@ -1180,8 +1224,7 @@ def library_screen(stdscr, settings):
         ch = stdscr.getch()
         error = ""
         if ch in ENTER_KEYS and books:
-            settings["book_id"] = books[sel]["id"]
-            settings["read_page_span"] = 1
+            select_book(settings, books[sel]["id"])
             return
         elif ch in (ord("n"), ord("N")):
             path = prompt_text(stdscr, "path to .txt/.epub/.pdf:")
@@ -1190,15 +1233,14 @@ def library_screen(stdscr, settings):
                 if isinstance(outcome, str):
                     error = outcome
                 else:
-                    settings["book_id"] = outcome
-                    settings["read_page_span"] = 1
+                    select_book(settings, outcome)
                     return
         elif ch in (ord("d"), ord("D")) and books:
             confirm = prompt_text(stdscr, "type 'yes' to delete '{}':".format(books[sel]["title"]))
             if confirm and confirm.lower() == "yes":
                 delete_book(books[sel]["id"])
                 if settings.get("book_id") == books[sel]["id"]:
-                    settings["book_id"] = None
+                    select_book(settings, None)
                 sel = max(0, sel - 1)
         elif ch == 27:
             return
@@ -1241,8 +1283,7 @@ def book_list_screen(stdscr, settings):
         stdscr.refresh()
         ch = stdscr.getch()
         if ch in ENTER_KEYS and books:
-            settings["book_id"] = books[sel]["id"]
-            settings["read_page_span"] = 1
+            select_book(settings, books[sel]["id"])
             return
         elif ch == 27:
             return
@@ -1767,7 +1808,7 @@ def _run(stdscr, settings):
                     apply_config_change(stdscr, settings["book_id"])
                 book = load_book(settings["book_id"])
                 if book is None:
-                    settings["book_id"] = None
+                    select_book(settings, None)
                     continue
                 if book["current_page"] >= book["total_pages"]:
                     action = book_finished_screen(stdscr, book["title"])
@@ -1900,6 +1941,10 @@ def main():
         return
     settings = {"time": max(10, args.time), "mode": args.mode, "ai": not args.offline,
                 "book_id": None, "read_page_span": 1}
+    if args.mode == "read":
+        # Carry on with whatever book was open last time, so relaunching drops
+        # you straight back into it rather than an empty library.
+        settings["book_id"] = last_book_id()
     try:
         curses.wrapper(_run, settings)
     except KeyboardInterrupt:
